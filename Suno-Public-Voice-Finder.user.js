@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Suno Public Voice Finder
 // @namespace    suno-voice-finder
-// @version      0.6.1
-// @description  Discovers public Suno voice/persona URLs from Suno API responses
+// @version      0.7.3
+// @description  Compact Voice and Discover searches with remix tags, language/model filters, and CSV export
 // @match        https://suno.com/*
 // @match        https://www.suno.com/*
 // @grant        unsafeWindow
@@ -30,6 +30,9 @@
      * growing the results list indefinitely.
      */
     const MAX_VOICES = 500;
+    const MAX_DISCOVER_SONGS = 5000;
+    const DISCOVER_PAGE_SIZE = 100;
+    const SONG_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
     /*
      * How often we check whether Suno rebuilt the sidebar.
@@ -47,11 +50,71 @@
         ['oldest', 'Oldest'],
         ['most_recent', 'Most recent']
     ];
+
+    /* Suno's currently displayed filter labels. Only the v6 backend value
+     * is established by the supplied request sample. Other model values use
+     * their UI labels verbatim until a matching request confirms the tokens. */
+    const LANGUAGE_OPTIONS = ["Arabic", "Bengali", "Chinese", "Czech", "Dutch", "English", "Finnish", "French", "German", "Greek", "Gujarati", "Hebrew", "Hindi", "Hungarian", "Indonesian", "Italian", "Japanese", "Kazakh", "Korean", "Malay", "Persian", "Polish", "Portuguese", "Panjabi", "Russian", "Spanish", "Swedish", "Tagalog", "Tamil", "Telugu", "Thai", "Turkish", "Ukrainian", "Urdu", "Vietnamese"];
+    const MODEL_OPTIONS = ["v3.0", "v3.5", "v4.0", "v4.5", "v4.5+", "v5", "v5.5", "v6", "Studio"];
+    const filtersByTab = {
+        voice: { languages: new Set(), model_versions: new Set() },
+        discover: { languages: new Set(), model_versions: new Set() }
+    };
+
+    function validatedSelections(raw, allowed) {
+        if (!Array.isArray(raw)) return new Set();
+        const valid = new Set(allowed);
+        return new Set(raw.filter(value => typeof value === 'string' && valid.has(value)));
+    }
+
+    function searchFiltersForTab(tab) {
+        const filters = filtersByTab[tab];
+        return {
+            ...(filters.languages.size ? { languages: [...filters.languages] } : {}),
+            ...(filters.model_versions.size ? { model_versions: [...filters.model_versions] } : {})
+        };
+    }
+
+    function updateFilterSummaries(panel = document.getElementById(PANEL_ID)) {
+        if (!panel) return;
+        const filters = filtersByTab[activeTab];
+        const langs = panel.querySelector('[data-suno-filter-summary="languages"]');
+        const models = panel.querySelector('[data-suno-filter-summary="model_versions"]');
+        if (langs) langs.textContent = filters.languages.size
+            ? `Lang (${filters.languages.size})` : 'Lang · Any';
+        if (models) models.textContent = filters.model_versions.size
+            ? `Model (${filters.model_versions.size})` : 'Model · Any';
+    }
+
+    function renderFilterDropdown(key, title, options, selected, busy) {
+        return `<details data-suno-filter="${key}" style="position:relative;flex:1;min-width:0;">
+            <summary data-suno-filter-summary="${key}" aria-label="${title} filter" style="list-style:none;cursor:pointer;padding:5px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border:1px solid #555;border-radius:6px;background:#202020;color:#fff;font-size:10px;">
+                ${title}${selected.size ? ` (${selected.size})` : ' · Any'}
+            </summary>
+            <div class="suno-filter-menu" style="position:absolute;left:0;right:0;top:calc(100% + 3px);z-index:30;max-height:185px;overflow-y:auto;overscroll-behavior:contain;background:#202020;border:1px solid #666;border-radius:7px;box-shadow:0 6px 18px #0009;">
+                <button type="button" class="suno-filter-clear" data-filter="${key}" ${busy ? 'disabled' : ''} style="display:block;position:sticky;top:0;width:100%;padding:8px;border:0;border-bottom:1px solid #555;background:#282828;color:#cbb9ff;text-align:left;cursor:pointer;font-size:11px;">Clear selection · Any</button>
+                ${options.map((value, index) => `<label style="display:flex;gap:7px;align-items:center;padding:6px;cursor:pointer;font-size:11px;">
+                    <input class="suno-filter-checkbox" data-filter="${key}" type="checkbox" value="${escapeHTML(value)}" ${selected.has(value) ? 'checked' : ''} ${busy ? 'disabled' : ''} style="accent-color:#7c4dff;">
+                    <span>${escapeHTML(value)}</span>
+                </label>`).join('')}
+            </div>
+        </details>`;
+    }
+
     let searchTerm = '';
     let searchRank = 'most_relevant';
     let searchTemplate = null;
     let searchController = null;
     let searchStatus = '';
+    let activeTab = 'voice';
+    const discoveredSongs = new Map();
+    let discoverSearchTerm = '';
+    let discoverSearchRank = 'most_relevant';
+    let discoverSearchStatus = '';
+    let discoverController = null;
+    let discoverVisible = DISCOVER_PAGE_SIZE;
+    let discoverRemixFilter = 'all'; // Client-side view/export filter; never sent as an unverified API parameter.
+    const listScrollTop = { voice: 0, discover: 0 };
     const GENRE_HANDOFF_KEY = 'sunoVoiceFinderGenreHandoff';
     let genreNavigationStarted = false;
     let pendingGenreSearch = false;
@@ -1009,6 +1072,7 @@
         panelOpen = false;
         stopAutoScroll();
         cancelManualSearch();
+        cancelDiscoverSearch();
         pendingGenreSearch = false;
 
         panel.style.display =
@@ -1501,34 +1565,54 @@
         return `${base}/genre/${encodeURIComponent(term.trim())}`;
     }
 
+    function currentSearchTerm() {
+        return activeTab === 'voice' ? searchTerm : discoverSearchTerm;
+    }
+
+    function setCurrentSearchStatus(message) {
+        if (activeTab === 'voice') searchStatus = message;
+        else discoverSearchStatus = message;
+    }
+
     function openGenreForSearch() {
         if (genreNavigationStarted) {
-            searchStatus = 'Waiting for Suno to finish loading this genre. Try Load voices again when it is ready.';
+            setCurrentSearchStatus('Waiting for Suno to finish loading this genre. Try again when it is ready.');
             updateSearchControls();
             return;
         }
-        const url = genrePageUrl(searchTerm);
+        const term = currentSearchTerm().trim();
+        const url = genrePageUrl(term);
         try {
-            // Only public result data crosses this navigation. Never save headers.
+            // Only public result data crosses navigation; never store authorization headers.
             sessionStorage.setItem(GENRE_HANDOFF_KEY, JSON.stringify({
                 expires: Date.now() + 120000,
-                url,
-                term: searchTerm.trim(),
-                rank: searchRank,
+                url, term,
+                activeTab,
+                rank: activeTab === 'voice' ? searchRank : discoverSearchRank,
+                voiceTerm: searchTerm,
+                voiceRank: searchRank,
+                voiceLanguages: [...filtersByTab.voice.languages],
+                voiceModels: [...filtersByTab.voice.model_versions],
+                discoverTerm: discoverSearchTerm,
+                discoverRank: discoverSearchRank,
+                discoverLanguages: [...filtersByTab.discover.languages],
+                discoverModels: [...filtersByTab.discover.model_versions],
+                discoverRemixFilter,
                 voices: [...found.values()].map(voice => ({
                     id: voice.id, name: voice.name, creator: voice.creator,
                     image: voice.image, sources: [...voice.sources]
-                }))
+                })),
+                songs: [...discoveredSongs.values()]
             }));
             genreNavigationStarted = true;
-            searchStatus = 'Opening genre…';
+            setCurrentSearchStatus('Opening genre…');
             stopAutoScroll();
             updateSearchControls();
             window.location.assign(url);
         } catch {
             genreNavigationStarted = false;
             try { sessionStorage.removeItem(GENRE_HANDOFF_KEY); } catch {}
-            searchStatus = 'Could not open the genre while preserving your results. Allow tab storage, then try again.';
+            setCurrentSearchStatus('Could not open the genre while preserving results. Allow tab storage, then try again.');
             updateSearchControls();
         }
     }
@@ -1540,12 +1624,22 @@
             sessionStorage.removeItem(GENRE_HANDOFF_KEY);
             const current = new URL(window.location.href);
             const target = new URL(value.url);
-            if (!['https://suno.com', 'https://www.suno.com'].includes(target.origin) || current.origin !== target.origin ||
+            if (!['https://suno.com', 'https://www.suno.com'].includes(target.origin) ||
+                current.origin !== target.origin ||
                 current.pathname.replace(/\/$/, '') !== target.pathname.replace(/\/$/, '') ||
                 !Number.isFinite(value.expires) || value.expires <= Date.now() ||
                 typeof value.term !== 'string' || !value.term.trim()) return;
-            searchTerm = value.term;
-            searchRank = SEARCH_SORTS.some(([key]) => key === value.rank) ? value.rank : 'most_relevant';
+            activeTab = value.activeTab === 'discover' ? 'discover' : 'voice';
+            searchTerm = typeof value.voiceTerm === 'string' ? value.voiceTerm : (activeTab === 'voice' ? value.term : '');
+            searchRank = validRank(value.voiceRank || (activeTab === 'voice' && value.rank));
+            discoverSearchTerm = typeof value.discoverTerm === 'string' ? value.discoverTerm : (activeTab === 'discover' ? value.term : '');
+            discoverSearchRank = validRank(value.discoverRank || (activeTab === 'discover' && value.rank));
+            filtersByTab.voice.languages = validatedSelections(value.voiceLanguages, LANGUAGE_OPTIONS);
+            filtersByTab.voice.model_versions = validatedSelections(value.voiceModels, MODEL_OPTIONS);
+            filtersByTab.discover.languages = validatedSelections(value.discoverLanguages, LANGUAGE_OPTIONS);
+            filtersByTab.discover.model_versions = validatedSelections(value.discoverModels, MODEL_OPTIONS);
+            discoverRemixFilter = ['all', 'enabled', 'disabled', 'unknown'].includes(value.discoverRemixFilter)
+                ? value.discoverRemixFilter : 'all';
             for (const voice of (Array.isArray(value.voices) ? value.voices : []).slice(0, MAX_VOICES)) {
                 if (!voice || typeof voice.id !== 'string') continue;
                 found.set(voice.id, {
@@ -1557,12 +1651,24 @@
                     sources: new Set((Array.isArray(voice.sources) ? voice.sources : []).filter(s => typeof s === 'string'))
                 });
             }
+            for (const song of (Array.isArray(value.songs) ? value.songs : []).slice(0, MAX_DISCOVER_SONGS)) {
+                if (!song || typeof song.id !== 'string' || !SONG_ID_PATTERN.test(song.id)) continue;
+                discoveredSongs.set(song.id, {
+                    ...song, url: `https://suno.com/song/${song.id}`,
+                    remixStatus: ['enabled', 'disabled', 'unknown'].includes(song.remixStatus) ? song.remixStatus : 'unknown',
+                    remixEvidence: typeof song.remixEvidence === 'string' ? song.remixEvidence : ''
+                });
+            }
             genreNavigationStarted = true;
             pendingGenreSearch = true;
             panelOpen = true;
             monitoring = true;
-            searchStatus = 'Loading genre…';
+            setCurrentSearchStatus('Loading genre…');
         } catch {}
+    }
+
+    function validRank(rank) {
+        return SEARCH_SORTS.some(([value]) => value === rank) ? rank : 'most_relevant';
     }
 
     function isStudioApiUrl(url) {
@@ -1584,27 +1690,157 @@
         return requestTemplate({ authorization: copy.get('authorization') }, credentials);
     }
 
-    function exportVoices() {
-        if (!found.size) return;
-        function cell(value) {
-            let text = String(value ?? '');
-            // Keep untrusted names from becoming spreadsheet formulas.
-            if (/^[\s\u0000-\u001f]*[=+@-]/.test(text) || /^[\t\r\n]/.test(text)) text = "'" + text;
-            return '"' + text.replaceAll('"', '""') + '"';
-        }
-        const rows = [['Voice ID', 'Name', 'Creator', 'Voice URL', 'Image URL', 'Sources']];
-        for (const voice of found.values()) {
-            rows.push([voice.id, voice.name, voice.creator, voice.url, voice.image, [...voice.sources].join('; ')]);
-        }
-        const csv = '\uFEFF' + rows.map(row => row.map(cell).join(',')).join('\r\n');
+    function csvCell(value) {
+        let text = String(value ?? '');
+        // Prevent untrusted song titles, tags and creator names becoming spreadsheet formulas.
+        if (/^[\s\u0000-\u001f]*[=+@-]/.test(text) || /^[\t\r\n]/.test(text)) text = "'" + text;
+        return '"' + text.replaceAll('"', '""') + '"';
+    }
+
+    function downloadCSV(rows, filename) {
+        const csv = '\uFEFF' + rows.map(row => row.map(csvCell).join(',')).join('\r\n');
         const blobUrl = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
         const link = document.createElement('a');
         link.href = blobUrl;
-        link.download = `Suno-Voices-${new Date().toISOString().slice(0, 10)}.csv`;
+        link.download = filename;
         document.documentElement.appendChild(link);
         link.click();
         link.remove();
         setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+    }
+
+    function exportVoices() {
+        if (!found.size) return;
+        const rows = [['Voice ID', 'Name', 'Creator', 'Voice URL', 'Image URL', 'Sources']];
+        for (const voice of found.values()) {
+            rows.push([voice.id, voice.name, voice.creator, voice.url, voice.image, [...voice.sources].join('; ')]);
+        }
+        downloadCSV(rows, `Suno-Voices-${new Date().toISOString().slice(0, 10)}.csv`);
+    }
+
+    function getDiscoverVisibleSongs() {
+        const songs = [...discoveredSongs.values()];
+        return discoverRemixFilter === 'all' ? songs :
+            songs.filter(song => song.remixStatus === discoverRemixFilter);
+    }
+
+    function countDiscoverRemixStatuses() {
+        const counts = { enabled: 0, disabled: 0, unknown: 0 };
+        for (const song of discoveredSongs.values()) {
+            counts[['enabled', 'disabled', 'unknown'].includes(song.remixStatus)
+                ? song.remixStatus : 'unknown']++;
+        }
+        return counts;
+    }
+
+    function exportDiscoverSongs() {
+        // Export the whole selected subset, NOT only the first 100 rendered cards.
+        const songs = getDiscoverVisibleSongs();
+        if (!songs.length) return;
+        const rows = [[
+            'Song ID', 'Title', 'Creator', 'Creator Handle', 'Song URL', 'Image URL',
+            'Plays', 'Likes', 'Created At', 'Tags', 'Remix Permission',
+            'Permission Evidence', 'Search Term', 'Search Sort'
+        ]];
+        for (const song of songs) {
+            rows.push([
+                song.id, song.title, song.creator, song.handle, song.url, song.image,
+                song.plays, song.likes, song.created, song.tags,
+                song.remixStatus === 'enabled' ? 'Enabled' :
+                    song.remixStatus === 'disabled' ? 'Disabled' : 'Unknown',
+                song.remixEvidence || '', song.term, song.rank
+            ]);
+        }
+        const suffix = discoverRemixFilter === 'all' ? '' : `-${discoverRemixFilter}`;
+        downloadCSV(rows, `Suno-Discover-Songs${suffix}-${new Date().toISOString().slice(0, 10)}.csv`);
+    }
+
+    // The /api/search/ response can return songs directly or nested in content_item.
+    // Require a real song UUID, title and song-shaped fields; never interpret persona IDs as songs.
+    function isPublicSong(obj) {
+        return !!(obj && !Array.isArray(obj) && typeof obj === 'object' &&
+            typeof obj.id === 'string' && SONG_ID_PATTERN.test(obj.id) &&
+            typeof obj.title === 'string' && obj.title.trim() &&
+            obj.is_public === true && obj.is_hidden !== true && obj.is_trashed !== true &&
+            (obj.entity_type === 'song_schema' || obj.content_type === 'clip' ||
+                typeof obj.audio_url === 'string' || Array.isArray(obj.media_urls) ||
+                typeof obj.video_url === 'string' || (obj.metadata && typeof obj.metadata === 'object')));
+    }
+
+    /*
+     * This marks in-Suno remix availability; it is not a general license
+     * to sample/download/redistribute a creator's audio outside Suno.
+     * Never interpret metadata.is_remix ("this song is a remix") as permission.
+     */
+    function songRemixPermission(clip) {
+        const declared = clip.metadata?.can_remix;
+        if (declared === true) return { status: 'enabled', evidence: 'metadata.can_remix' };
+        if (declared === false) return { status: 'disabled', evidence: 'metadata.can_remix' };
+        if (clip.can_remix === true) return { status: 'enabled', evidence: 'can_remix' };
+        if (clip.can_remix === false) return { status: 'disabled', evidence: 'can_remix' };
+
+        // If the explicit metadata flag is missing, native action availability
+        // can be a useful fallback. Do not guess based on "is_remix" or publicity.
+        const remixActions = Array.isArray(clip.action_config?.actions)
+            ? clip.action_config.actions.filter(action =>
+                ['remix_cover', 'remix_extend', 'remix_reuse_style'].includes(action?.action_type))
+            : [];
+        if (remixActions.some(action => action.visible === true && action.disabled === false)) {
+            return { status: 'enabled', evidence: 'remix action available' };
+        }
+        if (remixActions.length && remixActions.every(action =>
+            action.disabled === true || action.visible === false)) {
+            return { status: 'disabled', evidence: 'remix actions unavailable' };
+        }
+        return { status: 'unknown', evidence: 'not provided by search response' };
+    }
+
+    function songFromClip(clip, term, rank) {
+        const remix = songRemixPermission(clip);
+        return {
+            id: clip.id,
+            title: clip.title.trim(),
+            creator: clip.display_name || clip.user_display_name || clip.handle || '',
+            handle: clip.handle || clip.user_handle || '',
+            url: `https://suno.com/song/${clip.id}`,
+            image: clip.image_url || clip.image_large_url || '',
+            plays: Number.isFinite(clip.play_count) ? clip.play_count : '',
+            likes: Number.isFinite(clip.upvote_count) ? clip.upvote_count : '',
+            created: clip.created_at || '',
+            tags: typeof clip.display_tags === 'string' ? clip.display_tags :
+                typeof clip.metadata?.tags === 'string' ? clip.metadata.tags.slice(0, 500) : '',
+            term, rank,
+            remixStatus: remix.status,
+            remixEvidence: remix.evidence
+        };
+    }
+
+    function renderDiscoverSong(song) {
+        const image = song.image
+            ? `<img src="${escapeHTML(song.image)}" loading="lazy" style="width:38px;height:38px;border-radius:6px;object-fit:cover;flex-shrink:0;" alt="">`
+            : '<span style="width:38px;height:38px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">🎵</span>';
+        const creator = song.handle ? `@${song.handle}` : song.creator;
+        const titleCharacters = Array.from(song.title);
+        const visibleTitle = titleCharacters.length > 34
+            ? titleCharacters.slice(0, 33).join('').trimEnd() + '…' : song.title;
+        const remix = song.remixStatus === 'enabled'
+            ? { label: '● Remix ON', color: '#8ae6a2', bg: 'rgba(70,211,105,.13)' }
+            : song.remixStatus === 'disabled'
+                ? { label: '🔒 Remix OFF', color: '#e6b0a8', bg: 'rgba(220,110,90,.10)' }
+                : { label: '◌ Unknown', color: '#bbbbbb', bg: 'rgba(255,255,255,.06)' };
+        return `<div style="padding:8px 9px;border-top:1px solid var(--color-border-secondary,#333);display:flex;gap:8px;align-items:flex-start;">
+            ${image}<div style="min-width:0;flex:1;">
+            <div style="display:flex;align-items:center;gap:5px;min-width:0;max-width:100%;">
+                <span title="${escapeHTML(song.title)}" style="flex:1;min-width:0;font-size:11px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:help;">${escapeHTML(visibleTitle)}</span>
+                <span title="${escapeHTML((song.remixEvidence || 'Not reported') + ' · Suno in-app remix availability only; not a general audio reuse license')}"
+                    style="flex-shrink:0;white-space:nowrap;padding:2px 4px;border-radius:5px;background:${remix.bg};color:${remix.color};font-size:9px;font-weight:600;line-height:1.25;">${remix.label}</span>
+            </div>
+            <div style="font-size:10px;opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHTML(creator)}">${escapeHTML(creator)}</div>
+            <div style="font-size:9px;opacity:.55;margin:2px 0;">${escapeHTML(song.plays)} plays${song.likes !== '' ? ` · ${escapeHTML(song.likes)} likes` : ''}</div>
+            <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:5px;">
+            <a href="${escapeHTML(song.url)}" target="_blank" rel="noopener noreferrer" style="padding:4px 7px;border-radius:6px;background:#7c4dff;color:white;font-size:10px;font-weight:600;text-decoration:none;">Open Song</a>
+            <button type="button" class="suno-copy-url" data-url="${escapeHTML(song.url)}" style="padding:4px 7px;border-radius:6px;border:1px solid var(--color-border-secondary,#444);background:rgba(255,255,255,.04);color:inherit;cursor:pointer;font-size:10px;">Copy URL</button>
+            </div></div></div>`;
     }
 
     function isSearchUrl(url) {
@@ -1632,13 +1868,14 @@
     function rememberSearch(template) {
         if (!panelOpen || !template) return;
         if (!searchTemplate || template.fromSearch) searchTemplate = template;
-        if (!searchController) searchStatus = '';
+        if (!searchController && !discoverController) setCurrentSearchStatus('');
         updateSearchControls();
         if (pendingGenreSearch) {
             setTimeout(() => {
-                if (pendingGenreSearch && panelOpen && searchTemplate && !searchController) {
+                if (pendingGenreSearch && panelOpen && searchTemplate && !searchController && !discoverController) {
                     pendingGenreSearch = false;
-                    runManualSearch();
+                    if (activeTab === 'discover') runDiscoverSearch();
+                    else runManualSearch();
                 }
             }, 0);
         }
@@ -1646,28 +1883,41 @@
 
     function updateSearchControls() {
         const panel = document.getElementById(PANEL_ID);
-        if (!panel) return;
-        const busy = searchController !== null;
+        if (!panel || !panelOpen) return;
+        const discover = activeTab === 'discover';
+        const busy = searchController !== null || discoverController !== null;
+        const term = discover ? discoverSearchTerm : searchTerm;
         const button = panel.querySelector('#suno-search-submit');
         if (button) {
-            button.disabled = busy || !searchTerm.trim();
-            button.textContent = busy ? 'Searching…' : 'Load voices';
+            button.disabled = busy || !term.trim();
+            button.textContent = busy ? 'Searching…' : (discover ? 'Load songs' : 'Load voices');
             button.style.opacity = button.disabled ? '.5' : '1';
         }
         for (const id of ['suno-search-term', 'suno-search-sort', 'suno-voice-clear']) {
             const element = panel.querySelector(`#${id}`);
             if (element) element.disabled = busy;
         }
+        panel.querySelectorAll('.suno-filter-checkbox, .suno-filter-clear').forEach(el => {
+            el.disabled = busy;
+        });
+        updateFilterSummaries(panel);
         const exportButton = panel.querySelector('#suno-voice-export');
         if (exportButton) {
-            exportButton.disabled = found.size === 0;
+            exportButton.disabled = discover ? getDiscoverVisibleSongs().length === 0 : found.size === 0;
             exportButton.style.opacity = exportButton.disabled ? '.4' : '1';
+            exportButton.title = discover
+                ? (discoverRemixFilter === 'all' ? 'Export all collected songs as CSV'
+                    : `Export all ${discoverRemixFilter} songs as CSV (across all pages)`)
+                : 'Export voices as CSV';
+            exportButton.setAttribute('aria-label', exportButton.title);
         }
         const status = panel.querySelector('#suno-search-status');
         if (status) {
-            status.textContent = searchStatus || (searchTemplate
-                ? 'Ready · requests up to 1,000 songs per search.'
-                : 'First search opens the genre page. Later searches stay here.');
+            status.textContent = (discover ? discoverSearchStatus : searchStatus) || (searchTemplate
+                ? (discover ? 'Ready · up to 1,000 songs per search · CSV exports all.'
+                    : 'Ready · up to 1,000 songs · extracts public voices.')
+                : 'First search opens genre page; later searches stay here.');
+            status.title = status.textContent;
         }
     }
 
@@ -1678,8 +1928,15 @@
         searchStatus = 'Search canceled.';
     }
 
+    function cancelDiscoverSearch() {
+        if (!discoverController) return;
+        discoverController.abort();
+        discoverController = null;
+        discoverSearchStatus = 'Search canceled.';
+    }
+
     async function runManualSearch() {
-        if (!panelOpen || searchController || !searchTerm.trim()) return;
+        if (!panelOpen || searchController || discoverController || !searchTerm.trim()) return;
         if (!searchTemplate) {
             openGenreForSearch();
             return;
@@ -1717,7 +1974,8 @@
                     from_index: 0,
                     size: SEARCH_SIZE,
                     rank_by: rank,
-                    is_public: true
+                    is_public: true,
+                    ...searchFiltersForTab('voice')
                 }] })
             });
 
@@ -1781,6 +2039,106 @@
         }
     }
 
+    async function runDiscoverSearch() {
+        if (!panelOpen || discoverController || searchController || !discoverSearchTerm.trim()) return;
+        if (!searchTemplate) {
+            openGenreForSearch();
+            return;
+        }
+        pendingGenreSearch = false;
+        const term = discoverSearchTerm.trim();
+        const rank = validRank(discoverSearchRank);
+        const template = searchTemplate;
+        const controller = new w.AbortController();
+        discoverController = controller;
+        discoverSearchStatus = 'Searching up to 1,000 songs…';
+        stopAutoScroll();
+        renderPanel();
+        let timedOut = false;
+        const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 45000);
+        try {
+            // Exactly one request, using the working Voice search's payload and captured same-origin authorization.
+            const response = await originalFetch.call(w, SEARCH_URL, {
+                method: 'POST',
+                headers: new w.Headers(template.headers),
+                credentials: template.credentials,
+                mode: 'cors',
+                redirect: 'error',
+                signal: controller.signal,
+                body: JSON.stringify({ search_queries: [{
+                    name: 'tag_song', search_type: 'tag_song', term,
+                    from_index: 0, size: SEARCH_SIZE, rank_by: rank, is_public: true,
+                    ...searchFiltersForTab('discover')
+                }] })
+            });
+            if (!response.ok) {
+                if (response.status === 401 || response.status === 403) {
+                    if (searchTemplate === template) searchTemplate = null;
+                    throw new Error('Search was not authorized. Use Suno with Finder open to refresh the session, then try again.');
+                }
+                if (response.status === 429) throw new Error('Suno asked us to slow down. No retry was sent.');
+                throw new Error(`Search failed (HTTP ${response.status}). No retry was sent.`);
+            }
+            if (!/application\/json|\+json/i.test(response.headers.get('content-type') || '')) {
+                throw new Error('Suno returned a non-JSON response. No retry was sent.');
+            }
+            const data = await response.json();
+            if (controller.signal.aborted || !panelOpen || discoverController !== controller) return;
+            const seen = new Set();
+            const stack = [data];
+            let scanned = 0;
+            let added = 0;
+            // Keep only compact song metadata, not full prompts, lyrics or the 1,000-song response.
+            while (stack.length) {
+                if (controller.signal.aborted || !panelOpen || discoverController !== controller) return;
+                const item = stack.pop();
+                if (!item || typeof item !== 'object') continue;
+                if (isPublicSong(item) && !seen.has(item.id)) {
+                    seen.add(item.id);
+                    const existed = discoveredSongs.has(item.id);
+                    if (existed || discoveredSongs.size < MAX_DISCOVER_SONGS) {
+                        const song = songFromClip(item, term, rank);
+                        if (existed && song.remixStatus === 'unknown') {
+                            const previous = discoveredSongs.get(item.id);
+                            if (previous?.remixStatus && previous.remixStatus !== 'unknown') {
+                                song.remixStatus = previous.remixStatus;
+                                song.remixEvidence = previous.remixEvidence;
+                            }
+                        }
+                        discoveredSongs.set(item.id, song);
+                        if (!existed) added++;
+                    }
+                }
+                if (Array.isArray(item)) {
+                    for (const value of item) if (value && typeof value === 'object') stack.push(value);
+                } else {
+                    for (const value of Object.values(item)) {
+                        if (value && typeof value === 'object') stack.push(value);
+                    }
+                }
+                if (++scanned % 500 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+            }
+            const remixCounts = countDiscoverRemixStatuses();
+            discoverSearchStatus = `${seen.size} public songs in response · ${added} new · ${discoveredSongs.size} collected · ${remixCounts.enabled} remix ON.`;
+            if (remixCounts.unknown) discoverSearchStatus += ` ${remixCounts.unknown} unknown (no conclusive remix field).`;
+            if (discoveredSongs.size >= MAX_DISCOVER_SONGS) {
+                discoverSearchStatus += ` Collection limit: ${MAX_DISCOVER_SONGS}. Export and clear to collect more.`;
+            }
+        } catch (error) {
+            if (discoverController !== controller) return;
+            discoverSearchStatus = timedOut ? 'Search timed out. No retry was sent.'
+                : controller.signal.aborted ? 'Search canceled.'
+                : error instanceof SyntaxError ? 'Suno returned invalid JSON. No retry was sent.'
+                : error.message || 'Search failed. No retry was sent.';
+        } finally {
+            clearTimeout(timeout);
+            if (discoverController === controller) {
+                discoverController = null;
+                renderPanel();
+            }
+        }
+    }
+
 
     /*
      * ============================================================
@@ -1796,13 +2154,21 @@
         const panel =
             getPanel();
 
-        const voices =
-            [...found.values()];
+        const voices = [...found.values()];
+        const discover = activeTab === 'discover';
+        const songs = discover ? getDiscoverVisibleSongs() : [];
+        const remixCounts = discover ? countDiscoverRemixStatuses() : null;
+        const busy = searchController !== null || discoverController !== null;
         const focused = panel.contains(document.activeElement) ? document.activeElement : null;
         const focusedId = focused?.id;
         const selection = focusedId === 'suno-search-term'
             ? [focused.selectionStart, focused.selectionEnd] : null;
-        const listTop = panel.querySelector('#suno-voice-list')?.scrollTop || 0;
+        const listTop = panel.querySelector('#suno-voice-list')?.scrollTop ?? listScrollTop[activeTab];
+        listScrollTop[activeTab] = listTop;
+        const openFilterMenus = new Set([...panel.querySelectorAll('details[data-suno-filter]')]
+            .filter(el => el.open).map(el => el.dataset.sunoFilter));
+        const filterScrollTops = Object.fromEntries([...panel.querySelectorAll('details[data-suno-filter]')]
+            .map(el => [el.dataset.sunoFilter, el.querySelector('.suno-filter-menu')?.scrollTop || 0]));
 
         panel.innerHTML = `
             <div
@@ -1815,6 +2181,15 @@
                 "
             >
 
+                <div role="tablist" aria-label="Voice Finder sections" style="display:flex;gap:5px;padding:5px 9px 0;flex-shrink:0;">
+                    <button type="button" role="tab" data-suno-tab="voice" aria-selected="${!discover}"
+                        style="flex:1;min-width:0;border:1px solid var(--color-border-secondary,#444);border-bottom:${discover ? '1px solid var(--color-border-secondary,#444)' : '2px solid #7c4dff'};border-radius:7px 7px 0 0;background:${discover ? 'rgba(255,255,255,.035)' : 'rgba(124,77,255,.16)'};color:inherit;padding:5px 4px;cursor:pointer;font-size:11px;font-weight:${discover ? 400 : 700};">
+                        🎤 Voice <span style="opacity:.65">${found.size}</span></button>
+                    <button type="button" role="tab" data-suno-tab="discover" aria-selected="${discover}"
+                        style="flex:1;min-width:0;border:1px solid var(--color-border-secondary,#444);border-bottom:${discover ? '2px solid #7c4dff' : '1px solid var(--color-border-secondary,#444)'};border-radius:7px 7px 0 0;background:${discover ? 'rgba(124,77,255,.16)' : 'rgba(255,255,255,.035)'};color:inherit;padding:5px 4px;cursor:pointer;font-size:11px;font-weight:${discover ? 700 : 400};">
+                        🔎 Discover <span style="opacity:.65">${discoveredSongs.size}</span></button>
+                </div>
+
                 <div
                     id="suno-voice-drag-handle"
                     style="
@@ -1823,7 +2198,7 @@
                         align-items:center;
                         justify-content:space-between;
                         gap:8px;
-                        padding:12px;
+                        padding:7px 9px;
                         cursor:move;
                         user-select:none;
                         border-bottom:
@@ -1843,19 +2218,22 @@
                                 display:flex;
                                 align-items:center;
                                 gap:7px;
-                                font-size:14px;
+                                font-size:12px;
                                 font-weight:600;
+                                min-width:0;
+                                white-space:nowrap;
+                                overflow:hidden;
                             "
                         >
-                            🎤 Voice Finder
+                            ${discover ? '🔎 Discover' : '🎤 Voice Finder'}
 
                             <span
                                 style="
                                     opacity:.55;
-                                    font-size:11px;
+                                    font-size:10px;
                                 "
                             >
-                                (${voices.length})
+                                (${discover ? (discoverRemixFilter === 'all' ? discoveredSongs.size : `${songs.length}/${discoveredSongs.size}`) : voices.length})
                             </span>
                         </div>
 
@@ -1864,8 +2242,8 @@
                                 display:flex;
                                 align-items:center;
                                 gap:5px;
-                                margin-top:3px;
-                                font-size:10px;
+                                margin-top:2px;
+                                font-size:9px;
                                 opacity:.6;
                             "
                         >
@@ -1883,15 +2261,14 @@
                             Monitoring ON
 
                             ${
-                                found.size >=
-                                MAX_VOICES
-                                    ? ` · Limit reached (${MAX_VOICES})`
-                                    : ''
+                                discover
+                                    ? (discoveredSongs.size >= MAX_DISCOVER_SONGS ? ` · Limit reached (${MAX_DISCOVER_SONGS})` : '')
+                                    : (found.size >= MAX_VOICES ? ` · Limit reached (${MAX_VOICES})` : '')
                             }
 
                         </div>
 
-                        <div style="display:flex;align-items:center;gap:7px;margin-top:8px;">
+                        ${!discover ? `<div style="display:flex;align-items:center;gap:7px;margin-top:4px;">
                             <button
                                 id="suno-auto-scroll-toggle"
                                 type="button"
@@ -1924,7 +2301,7 @@
                             <span style="font-size:10px;opacity:.65;">
                                 Auto Scroll${autoScrollEnabled ? ' · every 7s' : ''}
                             </span>
-                        </div>
+                        </div>` : ''}
 
                     </div>
 
@@ -1937,7 +2314,7 @@
                         "
                     >
 
-                        <button id="suno-voice-export" type="button" title="Export voices as CSV" aria-label="Export voices as CSV"
+                        <button id="suno-voice-export" type="button" title="${discover ? 'Export collected songs as CSV' : 'Export voices as CSV'}" aria-label="Export CSV"
                             style="width:25px;height:27px;padding:3px;border:1px solid var(--color-border-secondary, #444);border-radius:6px;background:rgba(255,255,255,.04);color:inherit;cursor:pointer;">
                             <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"></path>
@@ -1983,20 +2360,36 @@
 
                 </div>
 
-                <form id="suno-search-form" style="flex-shrink:0;padding:10px 12px;border-bottom:1px solid var(--color-border-secondary, #333);">
-                    <label for="suno-search-term" style="display:block;font-size:11px;margin-bottom:5px;">Genre:</label>
+                <form id="suno-search-form" style="flex-shrink:0;padding:7px 9px 6px;border-bottom:1px solid var(--color-border-secondary, #333);">
                     <input id="suno-search-term" type="text" autocomplete="off"
-                        placeholder="Enter a genre, e.g. trap" value="${escapeHTML(searchTerm)}"
-                        style="box-sizing:border-box;width:100%;min-width:0;padding:7px;border:1px solid #555;border-radius:6px;background:#202020;color:#fff;font-size:12px;">
-                    <div style="display:flex;gap:6px;margin-top:7px;">
+                        aria-label="${discover ? 'Discover songs by genre or tag' : 'Search voices by genre'}"
+                        placeholder="${discover ? 'Genre / tag, e.g. trap' : 'Genre, e.g. trap'}" value="${escapeHTML(discover ? discoverSearchTerm : searchTerm)}"
+                        style="box-sizing:border-box;width:100%;min-width:0;padding:5px 7px;border:1px solid #555;border-radius:6px;background:#202020;color:#fff;font-size:11px;">
+                    <div style="display:flex;gap:5px;margin-top:5px;">
                         <select id="suno-search-sort" aria-label="Search sort order"
-                            style="flex:1;min-width:0;padding:6px;border:1px solid #555;border-radius:6px;background:#202020;color:#fff;font-size:11px;">
-                            ${SEARCH_SORTS.map(([value, label]) => `<option value="${value}" ${value === searchRank ? 'selected' : ''}>${label}</option>`).join('')}
+                            style="flex:1;min-width:0;padding:5px;border:1px solid #555;border-radius:6px;background:#202020;color:#fff;font-size:10px;">
+                            ${SEARCH_SORTS.map(([value, label]) => `<option value="${value}" ${value === (discover ? discoverSearchRank : searchRank) ? 'selected' : ''}>${label}</option>`).join('')}
                         </select>
-                        <button id="suno-search-submit" type="submit" style="padding:7px 9px;border:0;border-radius:6px;background:#7c4dff;color:white;font-size:11px;cursor:pointer;">Load voices</button>
+                        <button id="suno-search-submit" type="submit" style="flex-shrink:0;padding:5px 8px;border:0;border-radius:6px;background:#7c4dff;color:white;font-size:10px;cursor:pointer;">${discover ? 'Load songs' : 'Load voices'}</button>
                     </div>
+                    <div style="display:flex;gap:5px;margin-top:5px;align-items:stretch;">
+                        ${renderFilterDropdown('languages', 'Lang', LANGUAGE_OPTIONS, filtersByTab[activeTab].languages, busy)}
+                        ${renderFilterDropdown('model_versions', 'Model', MODEL_OPTIONS, filtersByTab[activeTab].model_versions, busy)}
+                        ${discover ? `<select id="suno-discover-remix-filter" aria-label="Filter collected songs by Suno remix availability"
+                            title="Filters collected songs and CSV export, not the Suno search request. Remix ON means in-app availability, not an audio reuse license."
+                            style="flex:1;min-width:0;padding:5px 3px;border:1px solid #555;border-radius:6px;background:#202020;color:#fff;font-size:10px;">
+                            <option value="all" ${discoverRemixFilter === 'all' ? 'selected' : ''}>Remix · Any</option>
+                            <option value="enabled" ${discoverRemixFilter === 'enabled' ? 'selected' : ''}>● Remix ON</option>
+                            <option value="disabled" ${discoverRemixFilter === 'disabled' ? 'selected' : ''}>🔒 Remix OFF</option>
+                            <option value="unknown" ${discoverRemixFilter === 'unknown' ? 'selected' : ''}>◌ Unknown</option>
+                        </select>` : ''}
+                    </div>
+                    ${discover ? `<div title="Remix filter applies to collected results and CSV, not to the Suno search request. Suno in-app remix permission is not a general audio reuse license."
+                        style="font-size:9px;opacity:.65;margin-top:4px;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                        ● ${remixCounts.enabled} ON · 🔒 ${remixCounts.disabled} OFF · ◌ ${remixCounts.unknown} unknown · ${songs.length}/${discoveredSongs.size} shown
+                    </div>` : ''}
                     <div id="suno-search-status" role="status" aria-live="polite"
-                        style="font-size:10px;line-height:1.4;opacity:.7;margin-top:7px;"></div>
+                        style="font-size:9px;line-height:1.25;opacity:.7;margin-top:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;"></div>
                 </form>
 
                 <div
@@ -2008,54 +2401,101 @@
                         overflow-x:hidden;
                     "
                 >
-                    ${
-                        voices.length
-                            ? voices
-                                .map(
-                                    renderVoice
-                                )
-                                .join('')
-                            : `
-                                <div
-                                    style="
-                                        padding:18px 14px;
-                                        opacity:.55;
-                                        font-size:12px;
-                                        line-height:1.5;
-                                    "
-                                >
-                                    Voice Finder is monitoring.
-
-                                    <br><br>
-
-                                    Browse, search, or scroll Suno
-                                    and public voices will appear here.
-                                </div>
-                            `
+                    ${discover
+                        ? (songs.length ? songs.slice(0, discoverVisible).map(renderDiscoverSong).join('') :
+                            `<div style="padding:18px 14px;opacity:.6;font-size:12px;line-height:1.5;">${discoveredSongs.size
+                                ? 'No collected songs match the selected Remix filter. Switch to Any to see everything.'
+                                : 'Search for a genre to load up to 1,000 public songs. Songs are separate from your Voice list.'}</div>`)
+                        : (voices.length ? voices.map(renderVoice).join('') :
+                            '<div style="padding:18px 14px;opacity:.6;font-size:12px;line-height:1.5;">Voice Finder is monitoring. Browse or search Suno and public voices will appear here.</div>')
                     }
+                    ${discover && songs.length > discoverVisible ? `
+                        <div style="padding:12px;text-align:center;">
+                            <div style="font-size:10px;opacity:.65;margin-bottom:8px;">Showing ${Math.min(discoverVisible, songs.length)} of ${songs.length} matching songs · CSV exports all matching</div>
+                            <button id="suno-discover-more" type="button" style="border:1px solid #555;border-radius:7px;background:#242424;color:white;padding:8px 12px;cursor:pointer;">Show next ${Math.min(DISCOVER_PAGE_SIZE, songs.length-discoverVisible)}</button>
+                        </div>` : ''}
                 </div>
 
             </div>
         `;
 
+        for (const menu of panel.querySelectorAll('details[data-suno-filter]')) {
+            if (openFilterMenus.has(menu.dataset.sunoFilter)) menu.open = true;
+            const list = menu.querySelector('.suno-filter-menu');
+            if (list) list.scrollTop = filterScrollTops[menu.dataset.sunoFilter] || 0;
+        }
+        panel.querySelectorAll('.suno-filter-checkbox').forEach(input => {
+            input.addEventListener('change', () => {
+                const selected = filtersByTab[activeTab][input.dataset.filter];
+                if (input.checked) selected.add(input.value);
+                else selected.delete(input.value);
+                updateFilterSummaries(panel);
+            });
+        });
+        panel.querySelectorAll('.suno-filter-clear').forEach(button => {
+            button.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (searchController || discoverController) return;
+                const key = button.dataset.filter;
+                filtersByTab[activeTab][key].clear();
+                const menu = button.closest('details');
+                menu?.querySelectorAll('.suno-filter-checkbox').forEach(input => { input.checked = false; });
+                updateFilterSummaries(panel);
+            });
+        });
+        panel.querySelectorAll('details[data-suno-filter]').forEach(menu => {
+            menu.addEventListener('click', event => {
+                if (event.target.closest('summary') && (searchController || discoverController)) {
+                    event.preventDefault();
+                }
+            });
+        });
+
         panel.querySelector('#suno-voice-export').addEventListener('click', event => {
             event.stopPropagation();
-            exportVoices();
+            if (activeTab === 'discover') exportDiscoverSongs();
+            else exportVoices();
         });
         panel.querySelector('#suno-search-term').addEventListener('input', event => {
-            searchTerm = event.target.value;
+            if (activeTab === 'discover') discoverSearchTerm = event.target.value;
+            else searchTerm = event.target.value;
             updateSearchControls();
         });
         panel.querySelector('#suno-search-sort').addEventListener('change', event => {
-            searchRank = event.target.value;
+            if (activeTab === 'discover') discoverSearchRank = event.target.value;
+            else searchRank = event.target.value;
+        });
+        panel.querySelector('#suno-discover-remix-filter')?.addEventListener('change', event => {
+            discoverRemixFilter = ['all', 'enabled', 'disabled', 'unknown'].includes(event.target.value)
+                ? event.target.value : 'all';
+            discoverVisible = DISCOVER_PAGE_SIZE;
+            listScrollTop.discover = 0;
+            renderPanel();
         });
         panel.querySelector('#suno-search-form').addEventListener('submit', event => {
             event.preventDefault();
             event.stopPropagation();
-            runManualSearch();
+            if (activeTab === 'discover') runDiscoverSearch();
+            else runManualSearch();
+        });
+        panel.querySelectorAll('[data-suno-tab]').forEach(tabButton => {
+            tabButton.addEventListener('click', () => {
+                const next = tabButton.dataset.sunoTab;
+                if (next === activeTab || busy) return;
+                listScrollTop[activeTab] = panel.querySelector('#suno-voice-list')?.scrollTop || 0;
+                stopAutoScroll();
+                activeTab = next;
+                renderPanel();
+            });
+        });
+        panel.querySelector('#suno-discover-more')?.addEventListener('click', () => {
+            listScrollTop.discover = panel.querySelector('#suno-voice-list')?.scrollTop || 0;
+            discoverVisible = Math.min(getDiscoverVisibleSongs().length, discoverVisible + DISCOVER_PAGE_SIZE);
+            renderPanel();
         });
         updateSearchControls();
-        panel.querySelector('#suno-voice-list').scrollTop = listTop;
+        panel.querySelector('#suno-voice-list').scrollTop = listScrollTop[activeTab];
         const restoreFocus = focusedId ? panel.querySelector(`#${focusedId}`) : null;
         if (restoreFocus && !restoreFocus.disabled) {
             restoreFocus.focus({ preventScroll: true });
@@ -2093,25 +2533,36 @@
                 event.stopPropagation();
 
                 if (
-                    found.size === 0 || searchController !== null
+                    (activeTab === 'discover' ? discoveredSongs.size === 0 : found.size === 0) ||
+                    searchController !== null || discoverController !== null
                 ) {
                     return;
                 }
 
                 const confirmed =
                     window.confirm(
-                        `Clear all ${found.size} collected voices?`
+                        activeTab === 'discover'
+                            ? `Clear all ${discoveredSongs.size} collected songs?`
+                            : `Clear all ${found.size} collected voices?`
                     );
 
                 if (!confirmed) {
                     return;
                 }
 
-                found.clear();
-                searchStatus = '';
+                if (activeTab === 'discover') {
+                    discoveredSongs.clear();
+                    discoverVisible = DISCOVER_PAGE_SIZE;
+                    listScrollTop.discover = 0;
+                    discoverSearchStatus = '';
+                } else {
+                    found.clear();
+                    listScrollTop.voice = 0;
+                    searchStatus = '';
+                }
 
                 console.log(
-                    '[Suno Voice Finder] Results cleared'
+                    '[Suno Voice Finder] Current tab results cleared'
                 );
 
                 updateNavButton();
@@ -2137,7 +2588,7 @@
          */
         panel
             .querySelectorAll(
-                '.suno-copy-voice'
+                '.suno-copy-voice, .suno-copy-url'
             )
             .forEach(
                 button => {
@@ -2597,7 +3048,7 @@
         if (panelOpen) openPanel();
 
         console.log(
-            '%c[Suno Voice Finder v0.6.1] loaded — monitoring OFF until opened',
+            '%c[Suno Voice Finder + Discover v0.7.3] loaded — monitoring OFF until opened',
             'color:#b79cff;font-weight:bold'
         );
     }
